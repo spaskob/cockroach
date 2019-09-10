@@ -60,7 +60,7 @@ type NodeLiveness interface {
 	GetLivenesses() []storagepb.Liveness
 }
 
-// Registry creates Jobs and manages their leases and cancelation.
+// Registry creates Jobs and manages their leases and cancellation.
 //
 // Job information is stored in the `system.jobs` table.  Each node will
 // poll this table and establish a lease on any claimed job. Registry
@@ -715,7 +715,7 @@ func (r *Registry) maybeAdoptJob(ctx context.Context, nl NodeLiveness) error {
 			// If we are currently running a job that another node has the lease on,
 			// stop running it.
 			if running {
-				log.Warningf(ctx, "job %d: node %d owns lease; canceling", *id, payload.Lease.NodeID)
+				log.Warningf(ctx, "job %d: node %d owns lease, our id is %d; canceling", *id, payload.Lease.NodeID, r.nodeID.Get())
 				r.unregister(*id)
 				continue
 			}
