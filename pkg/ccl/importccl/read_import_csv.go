@@ -107,7 +107,12 @@ func (c *csvInputReader) flushBatch(ctx context.Context, finished bool, progFn p
 }
 
 func (c *csvInputReader) readFile(
-	ctx context.Context, input *fileReader, inputIdx int32, inputName string, progressFn progressFn,
+	ctx context.Context,
+	input *fileReader,
+	inputIdx int32,
+	inputName string,
+	progressFn progressFn,
+	rejected chan string,
 ) error {
 	cr := csv.NewReader(input)
 	if c.opts.Comma != 0 {
@@ -168,7 +173,7 @@ type csvRecord struct {
 // convertRecordWorker converts CSV records into KV pairs and sends them on the
 // kvCh chan.
 func (c *csvInputReader) convertRecordWorker(ctx context.Context) error {
-	// Create a new evalCtx per converter so each go routine gets its own
+	// Create a new evalCtx per converter so each go routine gets its own
 	// collationenv, which can't be accessed in parallel.
 	evalCtx := c.evalCtx.Copy()
 	conv, err := row.NewDatumRowConverter(c.tableDesc, c.targetCols, evalCtx, c.kvCh)

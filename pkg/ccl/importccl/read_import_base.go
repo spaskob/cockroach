@@ -27,7 +27,7 @@ import (
 	"github.com/cockroachdb/errors"
 )
 
-type readFileFunc func(context.Context, *fileReader, int32, string, progressFn) error
+type readFileFunc func(context.Context, *fileReader, int32, string, progressFn, chan string) error
 
 // readInputFile reads each of the passed dataFiles using the passed func. The
 // key part of dataFiles is the unique index of the data file among all files in
@@ -125,7 +125,20 @@ func readInputFiles(
 				}
 			}
 
-			if err := fileFunc(ctx, src, dataFileIndex, dataFile, wrappedProgressFn); err != nil {
+			var rejected chan string
+			// start a worker to drain channel
+			// if there was any data in the end close file.
+			grp := ctxgroup.WithContext(ctx)
+			grp.GoCtx(func(ctx context.Context) error {
+				for s := range rejected {
+				  log.Infof(ctx, "rejected row:\n%s\n", s)
+				}
+				return nil
+			})
+			// save in a standard file.
+			// pass channel here to receive the rejected rows per this file
+			// update all impl
+			if err := fileFunc(ctx, src, dataFileIndex, dataFile, wrappedProgressFn, rejected); err != nil {
 				return errors.Wrap(err, dataFile)
 			}
 			if updateFromFiles {

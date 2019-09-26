@@ -64,7 +64,12 @@ func (d *mysqloutfileReader) readFiles(
 }
 
 func (d *mysqloutfileReader) readFile(
-	ctx context.Context, input *fileReader, inputIdx int32, inputName string, progressFn progressFn,
+	ctx context.Context,
+	input *fileReader,
+	inputIdx int32,
+	inputName string,
+	progressFn progressFn,
+	rejected chan string,
 ) error {
 	d.conv.KvBatch.Source = inputIdx
 	d.conv.FractionFn = input.ReadFraction
