@@ -967,6 +967,20 @@ func (r *importResumer) Resume(
 
 	r.res = res
 	r.statsRefresher = p.ExecCfg().StatsRefresher
+
+	telemetry.CountBucketed("import.rows", r.res.Rows)
+	const mb = 1 << 20
+	telemetry.CountBucketed("import.size-mb", r.res.DataSize/mb)
+	resultsCh <- tree.Datums{
+		tree.NewDInt(tree.DInt(*r.job.ID())),
+		tree.NewDString(string(jobs.StatusSucceeded)),
+		tree.NewDFloat(tree.DFloat(1.0)),
+		tree.NewDInt(tree.DInt(r.res.Rows)),
+		tree.NewDInt(tree.DInt(r.res.IndexEntries)),
+		tree.NewDInt(tree.DInt(r.res.SystemRecords)),
+		tree.NewDInt(tree.DInt(r.res.DataSize)),
+	}
+
 	return nil
 }
 
@@ -1118,27 +1132,6 @@ func (r *importResumer) OnSuccess(ctx context.Context, txn *client.Txn) error {
 	}
 
 	return nil
-}
-
-// OnTerminal is part of the jobs.Resumer interface.
-func (r *importResumer) OnTerminal(
-	ctx context.Context, status jobs.Status, resultsCh chan<- tree.Datums,
-) {
-	if status == jobs.StatusSucceeded {
-		telemetry.CountBucketed("import.rows", r.res.Rows)
-		const mb = 1 << 20
-		telemetry.CountBucketed("import.size-mb", r.res.DataSize/mb)
-
-		resultsCh <- tree.Datums{
-			tree.NewDInt(tree.DInt(*r.job.ID())),
-			tree.NewDString(string(jobs.StatusSucceeded)),
-			tree.NewDFloat(tree.DFloat(1.0)),
-			tree.NewDInt(tree.DInt(r.res.Rows)),
-			tree.NewDInt(tree.DInt(r.res.IndexEntries)),
-			tree.NewDInt(tree.DInt(r.res.SystemRecords)),
-			tree.NewDInt(tree.DInt(r.res.DataSize)),
-		}
-	}
 }
 
 var _ jobs.Resumer = &importResumer{}

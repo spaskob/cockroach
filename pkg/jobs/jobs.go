@@ -71,11 +71,17 @@ const (
 	StatusPaused Status = "paused"
 	// StatusFailed is for jobs that failed.
 	StatusFailed Status = "failed"
+	// StatusFailedReverting is for jobs that failed and their changes are being
+	// reverted.
+	StatusFailedReverting Status = "failed-reverting"
 	// StatusSucceeded is for jobs that have successfully completed.
 	StatusSucceeded Status = "succeeded"
 	// StatusCanceled is for jobs that were explicitly canceled by the user and
 	// cannot be resumed.
 	StatusCanceled Status = "canceled"
+	// StatusCancelRequested is for jobs that were requested to be canceled by
+	// the user.
+	StatusCancelRequested Status = "cancel-requested"
 )
 
 // Terminal returns whether this status represents a "terminal" state: a state
@@ -314,13 +320,13 @@ func (j *Job) resumed(ctx context.Context) error {
 	})
 }
 
-// Canceled sets the status of the tracked job to canceled. It does not directly
+// Canceled sets the status of the tracked job to cancel requested. It does not directly
 // cancel the job; like job.Paused, it expects the job to call job.Progressed
-// soon, observe a "job is canceled" error, and abort further work.
+// soon, observe a "job is cancel requested" error, and abort further work while getting
+// a chance to checkpoint its progress.
 func (j *Job) canceled(ctx context.Context, fn func(context.Context, *client.Txn) error) error {
 	return j.Update(ctx, func(txn *client.Txn, md JobMetadata, ju *JobUpdater) error {
-		if md.Status == StatusCanceled {
-			// Already canceled - do nothing.
+		if md.Status == StatusCanceled || md.Status == StatusCancelRequested {
 			return nil
 		}
 		if md.Status != StatusPaused && md.Status.Terminal() {
@@ -334,30 +340,27 @@ func (j *Job) canceled(ctx context.Context, fn func(context.Context, *client.Txn
 				return err
 			}
 		}
-		ju.UpdateStatus(StatusCanceled)
-		md.Payload.FinishedMicros = timeutil.ToUnixMicros(j.registry.clock.Now().GoTime())
+		ju.UpdateStatus(StatusCancelRequested)
 		ju.UpdatePayload(md.Payload)
 		return nil
 	})
 }
 
-// NoopFn is an empty function that can be used for Failed and Succeeded. It indicates
-// no transactional callback should be made during these operations.
-var NoopFn = func(context.Context, *client.Txn) error { return nil }
-
-// Failed marks the tracked job as having failed with the given error.
+// Failed sets the status of the tracked job to FailedReverting with the given error.
 func (j *Job) Failed(
-	ctx context.Context, err error, fn func(context.Context, *client.Txn) error,
+	ctx context.Context, err error, fn func(context.Context, interface{}) error,
 ) error {
 	return j.Update(ctx, func(txn *client.Txn, md JobMetadata, ju *JobUpdater) error {
 		if md.Status.Terminal() {
 			// Already done - do nothing.
 			return nil
 		}
-		if err := fn(ctx, txn); err != nil {
-			return err
+		if fn != nil {
+			if err := fn(ctx, txn); err != nil {
+				return err
+			}
 		}
-		ju.UpdateStatus(StatusFailed)
+		ju.UpdateStatus(StatusFailedReverting)
 		md.Payload.Error = err.Error()
 		md.Payload.FinishedMicros = timeutil.ToUnixMicros(j.registry.clock.Now().GoTime())
 		ju.UpdatePayload(md.Payload)
@@ -373,8 +376,10 @@ func (j *Job) Succeeded(ctx context.Context, fn func(context.Context, *client.Tx
 			// Already done - do nothing.
 			return nil
 		}
-		if err := fn(ctx, txn); err != nil {
-			return err
+		if fn != nil {
+			if err := fn(ctx, txn); err != nil {
+				return err
+			}
 		}
 		ju.UpdateStatus(StatusSucceeded)
 		md.Payload.FinishedMicros = timeutil.ToUnixMicros(j.registry.clock.Now().GoTime())

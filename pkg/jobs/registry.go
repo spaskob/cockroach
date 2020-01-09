@@ -240,7 +240,7 @@ func (r *Registry) StartJob(
 		r.unregister(*j.ID())
 		return nil, err
 	}
-	errCh, err := r.resume(resumeCtx, resumer, resultsCh, j)
+	errCh, err := r.resume(resumeCtx, resumer, resultsCh, j, StatusRunning)
 	if err != nil {
 		return nil, err
 	}
@@ -510,7 +510,7 @@ func (r *Registry) getJobFn(ctx context.Context, txn *client.Txn, id int64) (*Jo
 
 // Cancel marks the job with id as canceled using the specified txn (may be nil).
 func (r *Registry) Cancel(ctx context.Context, txn *client.Txn, id int64) error {
-	job, resumer, err := r.getJobFn(ctx, txn, id)
+	job, _, err := r.getJobFn(ctx, txn, id)
 	if err != nil {
 		// Special case schema change jobs to mark the job as canceled.
 		if job != nil {
@@ -525,12 +525,12 @@ func (r *Registry) Cancel(ctx context.Context, txn *client.Txn, id int64) error 
 			// safest way for now (i.e., without a larger jobs/schema change refactor)
 			// is to hack this up with a string comparison.
 			if payload.Type() == jobspb.TypeSchemaChange && !strings.HasPrefix(payload.Description, "ROLL BACK") {
-				return job.WithTxn(txn).canceled(ctx, NoopFn)
+				return job.WithTxn(txn).canceled(ctx, nil)
 			}
 		}
 		return err
 	}
-	return job.WithTxn(txn).canceled(ctx, resumer.OnFailOrCancel)
+	return job.WithTxn(txn).canceled(ctx, nil)
 }
 
 // Pause marks the job with id as paused using the specified txn (may be nil).
@@ -580,16 +580,12 @@ type Resumer interface {
 	// (for example, if a node died immediately after Success commits).
 	OnTerminal(ctx context.Context, status Status, resultsCh chan<- tree.Datums)
 
-	// OnFailOrCancel is called when a job fails or is canceled, and is called
-	// with the same txn that will mark the job as failed or canceled. The txn
-	// will only be committed if this doesn't return an error and the job state
-	// was successfully changed to failed or canceled. This is done so that
-	// transactional cleanup can be guaranteed to have happened.
+	// OnFailOrCancel is called when a job fails or is canceled.
 	//
-	// This method can be called during cancellation, which is not guaranteed to
-	// run on the node where the job is running. So it cannot assume that any
-	// other methods have been called on this Resumer object.
-	OnFailOrCancel(ctx context.Context, txn *client.Txn) error
+	// This method will be called when a registry notices the cancel request, which is not guaranteed
+	// to run on the node where the job is running. So it cannot assume that any other methods have
+	// been called on this Resumer object.
+	OnFailOrCancel(ctx context.Context, phs interface{}) error
 }
 
 // Constructor creates a resumable job of a certain type. The Resumer is
@@ -617,26 +613,13 @@ func (r *Registry) createResumer(job *Job, settings *cluster.Settings) (Resumer,
 	return fn(job, settings), nil
 }
 
-type retryJobError string
-
-// NewRetryJobError creates a new error that, if returned by a Resumer,
-// indicates to the jobs registry that the job should be restarted in the
-// background.
-func NewRetryJobError(s string) error {
-	return retryJobError(s)
-}
-
-func (r retryJobError) Error() string {
-	return string(r)
-}
-
 // resume starts or resumes a job. If no error is returned then the job was
-// asynchronously executed. The job is executed with the ctx, so ctx must
-// only by canceled if the job should also be canceled. resultsCh is passed
-// to the resumable func and should be closed by the caller after errCh sends
-// a value. errCh returns an error if the job was not completed with success.
+// asynchronously executed. The job is executed with the ctx, so ctx must only
+// by canceled if the job should also be canceled. resultsCh is passed to the
+// resumable func and should be closed by the caller after errCh sends a value.
+// errCh returns an error if the job was not completed with success.
 func (r *Registry) resume(
-	ctx context.Context, resumer Resumer, resultsCh chan<- tree.Datums, job *Job,
+	ctx context.Context, resumer Resumer, resultsCh chan<- tree.Datums, job *Job, status Status,
 ) (<-chan error, error) {
 	errCh := make(chan error, 1)
 	taskName := fmt.Sprintf(`job-%d`, *job.ID())
@@ -648,53 +631,57 @@ func (r *Registry) resume(
 		var span opentracing.Span
 		ctx, span = r.ac.AnnotateCtxWithSpan(ctx, spanName)
 		defer span.Finish()
-		resumeErr := resumer.Resume(ctx, phs, resultsCh)
-		if resumeErr != nil && ctx.Err() != nil {
-			// The context was canceled. Tell the user, but don't attempt to mark the
-			// job as failed because it can be resumed by another node.
-			resumeErr = NewRetryJobError("node liveness error")
-		}
-		if e, ok := resumeErr.(retryJobError); ok {
-			r.unregister(*job.id)
-			errCh <- errors.Errorf("job %d: %s: restarting in background", *job.id, e)
-			return
-		}
-		terminal := true
-		var status Status
-		defer r.unregister(*job.id)
-		if err, ok := errors.Cause(resumeErr).(*InvalidStatusError); ok &&
-			(err.status == StatusPaused || err.status == StatusCanceled) {
-			if err.status == StatusPaused {
-				terminal = false
+		var resumeErr error
+		var terminal bool
+		defer func() {
+			if status.Terminal() {
+				resumer.OnTerminal(ctx, status, resultsCh)
 			}
-			// If we couldn't operate on the job because it was paused or canceled, send
-			// the more understandable "job paused" or "job canceled" error message to
-			// the user.
-			resumeErr = errors.Errorf("job %s", err.status)
-			status = err.status
-		} else {
-			// Attempt to mark the job as succeeded.
+			errCh <- resumeErr
+			r.unregister(*job.id)
+		}()
+		if status == StatusPending || status == StatusRunning {
+			resumeErr = resumer.Resume(ctx, phs, resultsCh)
 			if resumeErr == nil {
-				status = StatusSucceeded
 				if err := job.Succeeded(ctx, resumer.OnSuccess); err != nil {
 					// If it didn't succeed, mark it failed.
 					resumeErr = errors.Wrapf(err, "could not mark job %d as succeeded", *job.id)
+				} else if ctx.Err() != nil {
+					// The context was canceled. Tell the user, but don't attempt to mark the
+					// job as failed because it can be resumed by another node.
+					errCh <- errors.Errorf("job %d: node liveness error: restarting in background", *job.id)
+					return
 				}
 			}
-			if resumeErr != nil {
-				status = StatusFailed
+		}
+		// get status and check if the job is paused or cancel requested
+		if status == StatusPending {
+			// mark job as CanceledReverting
+			return
+		}
+		if status == StatusCancelRequested {
+			// mark job as CanceledReverting
+		} else
+		// mark job as failed
+		resumeErr = resumer.OnFailOrCancel(ctx, phs)
+		if resumeErr != nil {
+			if err, ok := errors.Cause(resumeErr).(*InvalidStatusError); ok {
+				// If we couldn't operate on the job because it was paused or canceled, send
+				// the more understandable "job paused" or "job canceled" error message to
+				// the user.
+				resumeErr = errors.Errorf("job %s", err.status)
+			} else if !reverting {
+				status = StatusFailedReverting
 				if err := job.Failed(ctx, resumeErr, resumer.OnFailOrCancel); err != nil {
 					// If we can't transactionally mark the job as failed then it will be
 					// restarted during the next adopt loop and retried.
 					resumeErr = errors.Wrapf(err, "could not mark job %d as failed: %s", *job.id, resumeErr)
-					terminal = false
+				} else {
+					status = StatusFailed
 				}
 			}
 		}
 
-		if terminal {
-			resumer.OnTerminal(ctx, status, resultsCh)
-		}
 		errCh <- resumeErr
 	}); err != nil {
 		return nil, err
@@ -703,9 +690,12 @@ func (r *Registry) resume(
 }
 
 func (r *Registry) maybeAdoptJob(ctx context.Context, nl NodeLiveness) error {
-	const stmt = `SELECT id, payload, progress IS NULL FROM system.jobs WHERE status IN ($1, $2) ORDER BY created DESC`
+	const stmt = `
+SELECT id, payload, progress IS NULL, status
+FROM system.jobs
+WHERE status IN ($1, $2, $3, $4) ORDER BY created DESC`
 	rows, err := r.ex.Query(
-		ctx, "adopt-job", nil /* txn */, stmt, StatusPending, StatusRunning,
+		ctx, "adopt-job", nil /* txn */, stmt, StatusPending, StatusRunning, StatusCancelRequested, StatusFailedReverting,
 	)
 	if err != nil {
 		return err
@@ -841,7 +831,8 @@ func (r *Registry) maybeAdoptJob(ctx context.Context, nl NodeLiveness) error {
 		if err != nil {
 			return err
 		}
-		errCh, err := r.resume(resumeCtx, resumer, resultsCh, job)
+		status := (*Status)(row[3].(*tree.DString))
+		errCh, err := r.resume(resumeCtx, resumer, resultsCh, job, *status)
 		if err != nil {
 			return err
 		}
