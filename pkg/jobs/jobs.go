@@ -522,6 +522,9 @@ func (j *Job) adopt(ctx context.Context, oldLease *jobspb.Lease) error {
 				md.Payload.Lease, oldLease)
 		}
 		md.Payload.Lease = j.registry.newLease()
+		if md.Payload.StartedMicros  == 0 {
+			md.Payload.StartedMicros = timeutil.ToUnixMicros(j.registry.clock.Now().GoTime())
+		}
 		ju.UpdatePayload(md.Payload)
 		ju.UpdateStatus(StatusRunning)
 		return nil
@@ -556,4 +559,32 @@ func UnmarshalProgress(datum tree.Datum) (*jobspb.Progress, error) {
 		return nil, err
 	}
 	return progress, nil
+}
+
+// CurrentStatus returns the current job status from the jobs table or error.
+func (j *Job) CurrentStatus(ctx context.Context) (Status, error) {
+	if j.id == nil {
+		return "", errors.New("job has not been created")
+	}
+	var statusString *tree.DString
+	if err := j.runInTxn(ctx, func(ctx context.Context, txn *client.Txn) error {
+		const selectStmt = "SELECT status FROM system.jobs WHERE id = $1"
+		row, err := j.registry.ex.QueryRow(ctx, "log-job", txn, selectStmt, *j.id)
+		if err != nil {
+			return errors.Wrapf(err, "job %d: can't query system.jobs", j.id)
+		}
+		if row == nil {
+			return errors.Errorf("job %d: no found in system.jobs", *j.id)
+		}
+
+		var ok bool
+		statusString, ok = row[0].(*tree.DString)
+		if !ok {
+			return errors.Errorf("job %d: expected string status but got %T", *j.id, statusString)
+		}
+		return nil
+	}); err != nil {
+		return "", err
+	}
+	return Status(*statusString), nil
 }
