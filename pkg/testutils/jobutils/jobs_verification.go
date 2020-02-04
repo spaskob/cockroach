@@ -18,7 +18,6 @@ import (
 	"sort"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
@@ -27,7 +26,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/storage/storagebase"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
-	"github.com/cockroachdb/cockroach/pkg/util/retry"
 	"github.com/kr/pretty"
 	"github.com/lib/pq"
 	"github.com/pkg/errors"
@@ -36,25 +34,28 @@ import (
 // WaitForJob waits for the specified job ID to terminate.
 func WaitForJob(t testing.TB, db *sqlutils.SQLRunner, jobID int64) {
 	t.Helper()
-	if err := retry.ForDuration(time.Minute*2, func() error {
-		var status string
-		var payloadBytes []byte
-		db.QueryRow(
-			t, `SELECT status, payload FROM system.jobs WHERE id = $1`, jobID,
-		).Scan(&status, &payloadBytes)
-		if jobs.Status(status) == jobs.StatusFailed {
-			payload := &jobspb.Payload{}
-			if err := protoutil.Unmarshal(payloadBytes, payload); err == nil {
-				t.Fatalf("job failed: %s", payload.Error)
-			}
-			t.Fatalf("job failed")
-		}
-		if e, a := jobs.StatusSucceeded, jobs.Status(status); e != a {
-			return errors.Errorf("expected job status %s, but got %s", e, a)
-		}
-		return nil
-	}); err != nil {
+	ctx := context.Background()
+	type row struct {
+		id     int64
+		status string
+	}
+	var out row
+	if err := db.DB.QueryRowContext(
+		ctx,
+		`SELECT job_id, status
+				 FROM [SHOW JOB WHEN COMPLETE $1]`,
+		jobID).Scan(&out.id, &out.status); err != nil {
 		t.Fatal(err)
+	}
+	if jobID != out.id {
+		t.Fatal(errors.Errorf(
+			"Expected job id %d but got %d", jobID, out.id))
+	}
+	if jobs.Status(out.status) == jobs.StatusFailed {
+			t.Fatalf("job failed")
+	}
+	if e, a := jobs.StatusSucceeded, jobs.Status(out.status); e != a {
+		t.Fatal(errors.Errorf("expected job status %s, but got %s", e, a))
 	}
 }
 

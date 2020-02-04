@@ -1013,7 +1013,6 @@ func getHighWaterMark(jobID int64, sqlDB *gosql.DB) (roachpb.Key, error) {
 // work as intended on backup and restore jobs.
 func TestBackupRestoreControlJob(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	t.Skip("#24136")
 
 	// force every call to update
 	defer jobs.TestingSetProgressThresholds()()
@@ -1108,7 +1107,7 @@ func TestBackupRestoreControlJob(t *testing.T) {
 		} {
 			ops := []string{"PAUSE", "RESUME", "PAUSE"}
 			jobID, err := jobutils.RunJob(t, sqlDB, &allowResponse, ops, query, pauseDir)
-			if !testutils.IsError(err, "job paused") {
+			if !testutils.IsError(err, "job pause-requested") {
 				t.Fatalf("%d: expected 'job paused' error, but got %+v", i, err)
 			}
 			if i > 0 {
@@ -1151,8 +1150,8 @@ func TestBackupRestoreControlJob(t *testing.T) {
 		query := `RESTORE DATABASE data FROM $1`
 		ops := []string{"PAUSE"}
 		jobID, err := jobutils.RunJob(t, sqlDB, &allowResponse, ops, query, backupDir)
-		if !testutils.IsError(err, "job paused") {
-			t.Fatalf("expected 'job paused' error, but got %+v", err)
+		if !testutils.IsError(err, "job pause-requested") {
+			t.Fatalf("expected 'job pause-requested' error, but got %+v", err)
 		}
 
 		// Create a table while the RESTORE is in progress on the database that was
