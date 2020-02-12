@@ -12,9 +12,14 @@ package sql
 
 import (
 	"context"
+	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/jobs"
+	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/retry"
 	"github.com/cockroachdb/errors"
 )
 
@@ -59,6 +64,38 @@ func (n *controlJobsNode) startExec(params runParams) error {
 		switch n.desiredStatus {
 		case jobs.StatusPaused:
 			err = reg.PauseRequested(params.ctx, params.p.txn, int64(jobID))
+			if err != nil {
+				break
+			}
+			log.Infof(params.ctx, "job %d: pause requested, waiting to be paused", int64(jobID))
+			// PauseRequested does not actually pause the job but only sends a
+			// request for it. Actually block until the job state changes.
+			opts := retry.Options{
+				InitialBackoff: 4 * time.Second,
+				MaxBackoff:     time.Minute,
+				Multiplier:     2,
+			}
+			err = retry.WithMaxAttempts(params.ctx, opts, 10, func() error {
+				row, err := params.p.ExecCfg().InternalExecutor.QueryRowEx(
+					params.ctx,
+					"job-status",
+					params.p.txn,
+					sqlbase.InternalExecutorSessionDataOverride{User: security.RootUser},
+					`SELECT status FROM system.jobs WHERE id = $1`,
+					int64(jobID))
+				if err != nil {
+					return err
+				}
+				statusString := tree.MustBeDString(row[0])
+				if jobs.Status(statusString) != jobs.StatusPaused {
+					return errors.Errorf("job %id: timed out waiting to be paused", int64(jobID))
+				}
+				return nil
+			})
+			if err != nil {
+				log.Error(params.ctx, "%v", err)
+			}
+			log.Infof(params.ctx, "job %d: paused", int64(jobID))
 		case jobs.StatusRunning:
 			err = reg.Resume(params.ctx, params.p.txn, int64(jobID))
 		case jobs.StatusCanceled:
