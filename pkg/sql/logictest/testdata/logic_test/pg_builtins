@@ -14,3 +14,14 @@ query O
 SELECT pg_my_temp_schema()
 ----
 0
+
+repeat 4
+query B
+SELECT pg_advisory_lock_shared(1)
+----
+true
+
+query B
+SELECT pg_advisory_lock(2)
+----
+true
