@@ -34,7 +34,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/blobs/blobspb"
 	"github.com/cockroachdb/cockroach/pkg/gossip"
 	"github.com/cockroachdb/cockroach/pkg/internal/client"
-	"github.com/cockroachdb/cockroach/pkg/internal/client/leasemanager"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
@@ -487,7 +486,7 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 		Settings:         st,
 	})
 
-	s.lockManager = leasemanager.New(keys.MakeTablePrefix(keys.PGLocksTableID), s.db)
+	s.lockManager = pgadvisory.NewFakeLockManager()
 
 	// Similarly for execCfg.
 	var execCfg sql.ExecutorConfig

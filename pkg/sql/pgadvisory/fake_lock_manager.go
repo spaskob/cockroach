@@ -25,7 +25,7 @@ import (
 )
 
 type FakeLock struct {
-	exclusive   map[uuid.UUID]*client.Txn
+	exclusive   *client.Txn
 	shared      map[uuid.UUID]*client.Txn
 	key         []byte
 	txn         *client.Txn
@@ -36,6 +36,7 @@ type FakeLock struct {
 var _ leasemanager.Lease = &FakeLock{}
 
 type FakeLockManager struct {
+	sync.Mutex
 	locks map[string]*FakeLock
 }
 
@@ -80,15 +81,16 @@ func (l *FakeLock) StartTime() hlc.Timestamp {
 }
 
 func (fm *FakeLockManager) unlockFinalized() {
+	fm.Lock()
+	defer fm.Unlock()
 	for _, lock := range fm.locks {
-		for _, txn := range lock.exclusive {
-			if txn.Sender().TxnStatus().IsFinalized() {
-				lock.mu.Unlock()
-			}
+		if lock.exclusive != nil && lock.exclusive.Sender().TxnStatus().IsFinalized() {
+			lock.mu.Unlock()
 		}
-		for _, txn := range lock.shared {
+		for id, txn := range lock.shared {
 			if txn.Sender().TxnStatus().IsFinalized() {
 				lock.mu.RUnlock()
+				delete(lock.shared, id)
 			}
 		}
 	}
@@ -96,11 +98,13 @@ func (fm *FakeLockManager) unlockFinalized() {
 }
 
 func (fm *FakeLockManager) upsertLock(txn *client.Txn, key []byte) *FakeLock {
+	fm.Lock()
+	defer fm.Unlock()
 	strKey := string(key)
 	storedLock, found := fm.locks[strKey]
 	if !found {
 		storedLock = &FakeLock{
-			exclusive: make(map[uuid.UUID]*client.Txn),
+			exclusive: nil,
 			shared:    make(map[uuid.UUID]*client.Txn),
 			mu:        sync.RWMutex{},
 		}
@@ -114,9 +118,9 @@ func (fm *FakeLockManager) AcquireExclusive(
 	ctx context.Context, txn *client.Txn, key []byte,
 ) (leasemanager.Lease, error) {
 	storedLock := fm.upsertLock(txn, key)
-	storedLock.exclusive[txn.ID()] = txn
-	storedLock.isExclusive = true
 	storedLock.mu.Lock()
+	storedLock.exclusive = txn
+	storedLock.isExclusive = true
 	return storedLock, nil
 }
 
@@ -124,12 +128,12 @@ func (fm *FakeLockManager) AcquireShared(
 	ctx context.Context, txn *client.Txn, key []byte,
 ) (leasemanager.Lease, error) {
 	storedLock := fm.upsertLock(txn, key)
-	storedLock.shared[txn.ID()] = txn
 	storedLock.mu.RLock()
+	storedLock.shared[txn.ID()] = txn
 	return storedLock, nil
 }
 
-func (fm *FakeLockManager) TryAcquireEx(
+func (fm *FakeLockManager) TryAcquireExclusive(
 	ctx context.Context, txn *client.Txn, key []byte,
 ) (lock leasemanager.Lease, err error) {
 	group := ctxgroup.WithContext(context.Background())
