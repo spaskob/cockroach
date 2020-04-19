@@ -1,22 +1,52 @@
-
 Jobs are a hierarchy of tasks
-Task is the scheduling unit
+
+Task is the smallest cheduling unit.
+Group of tasks can be scheduled together if they need to share
+resources on the same node.
 Task is a Go struct that implements Run and Commit.
 Tasks should be short and intermediate state is not persisted.
-Checkpointing works transparently by persistings the ids of successful tasks.
+Task commit is idempotent: it deletes the task and commits its result
+(for example renaming temp output to final output).
+
+A task starts when its dependencies complete.
+
+TaskQueue sits on top of the database and makes sure that a task is run at least once.
+
+Worker
+- locks the task id
+- heart beats it
+- when task is finished it is deleted from the database
+- ideally tasks should log to separate file.
+
+
+Checkpointing works transparently by persisting the ids of successful tasks.
 On successful retry they are not run.
 
-Job requests put job description in `staged_jobs`.  Job request is description
+
+Job is a set of groups of tasks. A group of tasks is scheduled on 1 node.
+
+Job requests put job description in `staged_jobs` table.  Job request is description
 that is "compiled" into a DAG of tasks.  The tasks are written to a separate
 table `tasks` in the same transaction that creates the job. The translation
 will also set `max_reties` The root task is the job itself and it it succeeds
 when all children succeed.  DAG of tasks descriptions is persisted in the row
 of `staged_jobs`.
 
+
 Tasks table:
 :name
 :args (encoding of args???)
-_max_retries
+:max_retries
+:attempts
+:priority
+:handler (who knows how to run the job)
+:last_error
+:queue - on which queue is it
+:locked_by - who is working on the task
+
+The DB is only used for staging the tasks and then teh scheduler puts them
+on different queues which has an assigned handler.
+
 
 type Task interface {
   Run(args)
@@ -24,9 +54,18 @@ type Task interface {
   // Queues are arbitrary and created on the fly.
   // you can name them whatever you want and have as many as you want. 
   queue string
+}
+
 
 So far this is only declarative. The next stage is describes how these declarations
 are executed.
+
+
+Scheduling - assigning tasks to workers.
+Worklflow:
+
+create/update job or failed node --> evaluation  --> allocation plan --> placed allocation
+allocation plans are read in batch and put in memory to decrease table contention.
 
 Batches of tasks of staged jobs are taken off `staged_jobs` and are put on a queue(s).
 If a task fails the job fails as well. The DAG of tasks share same `job_id`.  Worker
@@ -37,6 +76,7 @@ Schedulers read from the queue and execute tasks calling Run.  When task
 commits it is transactionally removed from the queue and it's commit method is
 executed.  A task is not removed from the queue until it's been confirmed to have succeeded or failed on a worker.
 
+
 Workers execute tasks. Worker it will keep checking it's first queue and only when it is empty
 it will look at the next queue. Empty queues means it will take anything. Alternative is to use
 priorities.Or you can use * for any queue.
@@ -45,6 +85,28 @@ priorities.Or you can use * for any queue.
 struct Worker{
   queues []Queue
 }
+
+Named queues provide a convenient system for grouping tasks to be worked by separate pools
+of workers, which may be scaled and controlled individually.
+
+Named queues should be:
+arbitrarily named and created on-the-fly (just put a job in a queue and that queue exists)
+ignored by default (Workers should pull from all queues unless told not to for backwards compatibility)
+efficient (Backends must properly index so that queues are efficient even when
+large) ignorant of the priority and delaying system. Priority and run_at should
+continue to function as before when jobs are segmented by queue.
+
+If no queue option is specified, workers will work all queues. More than one
+queue may be specified to a worker. Both singular and plural queue option names
+are provided for convenience and are interchangeable.
+
+Advantages:
+For example:
+temporarily disable processing of a class of jobs (due to load, debugging, etc)
+only run certain jobs in bursts when there is excess capacity (batch)
+allow a normally low priority job to have a higher-priority instance (to "catchup" a missed job, etc)
+
+
 
 Task Logging / Error handling ???
 Write to logs/task/id/logfile ??? 
@@ -55,3 +117,12 @@ QUIT - Wait for child to finish processing then exit
 TERM / INT - Immediately kill child then exit
 USR2 - Don't start to process any new jobs
 CONT - Start to process new jobs again after a USR2 
+
+
+
+Idempotent jobs
+Jobs can specify that exactly one instance of a job should be executing at once and que-locks will prevent the enqueuing and execution of any other instance of the same job with the same arguments. This is useful for jobs that are doing something important that should only ever happen one at a time, like processing a payment for a given user, or super expensive jobs that could cause thundering herd problems if enqueued all at the same time.
+
+que-locks uses Postgres' advisory locks in a similar manner as que does to provide scalable and automatically cleaned-up-locking around job execution. que-locks provides slightly better atomicity guarantees compared to the locking functionality of Redis based job queues for the same reasons que can as well! Because locks are taken and released using the same database connection that the que worker uses to pull jobs, the robust transactional semantics Postgres provides apply just the same. Locks are automatically released if the connection fails, and don't require heart-beating beyond what the Postgres client already does, unlike the multi-step Redis logic that requires lock TTLs, heartbeats, and complicated crash cleanup.
+
+This is also sometimes called unique jobs, serialized jobs, job concurrency limiting, and/or exclusive jobs.
