@@ -1,0 +1,57 @@
+
+Jobs are a hierarchy of tasks
+Task is the scheduling unit
+Task is a Go struct that implements Run and Commit.
+Tasks should be short and intermediate state is not persisted.
+Checkpointing works transparently by persistings the ids of successful tasks.
+On successful retry they are not run.
+
+Job requests put job description in `staged_jobs`.  Job request is description
+that is "compiled" into a DAG of tasks.  The tasks are written to a separate
+table `tasks` in the same transaction that creates the job. The translation
+will also set `max_reties` The root task is the job itself and it it succeeds
+when all children succeed.  DAG of tasks descriptions is persisted in the row
+of `staged_jobs`.
+
+Tasks table:
+:name
+:args (encoding of args???)
+_max_retries
+
+type Task interface {
+  Run(args)
+  // determines on which queue task will be placed on.
+  // Queues are arbitrary and created on the fly.
+  // you can name them whatever you want and have as many as you want. 
+  queue string
+
+So far this is only declarative. The next stage is describes how these declarations
+are executed.
+
+Batches of tasks of staged jobs are taken off `staged_jobs` and are put on a queue(s).
+If a task fails the job fails as well. The DAG of tasks share same `job_id`.  Worker
+contention while locking can cause a variety of bad operational problems for a
+job queue that's put directly in a database
+
+Schedulers read from the queue and execute tasks calling Run.  When task
+commits it is transactionally removed from the queue and it's commit method is
+executed.  A task is not removed from the queue until it's been confirmed to have succeeded or failed on a worker.
+
+Workers execute tasks. Worker it will keep checking it's first queue and only when it is empty
+it will look at the next queue. Empty queues means it will take anything. Alternative is to use
+priorities.Or you can use * for any queue.
+(Run several nodes on the same machine the extra nodes configured to run specific queues???).
+
+struct Worker{
+  queues []Queue
+}
+
+Task Logging / Error handling ???
+Write to logs/task/id/logfile ??? 
+WorkMaster that spawns all other workers?
+Resource management, memory leaks, isolation?
+Singals to workers 
+QUIT - Wait for child to finish processing then exit
+TERM / INT - Immediately kill child then exit
+USR2 - Don't start to process any new jobs
+CONT - Start to process new jobs again after a USR2 
