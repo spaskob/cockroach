@@ -23,7 +23,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
-	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
@@ -991,6 +990,179 @@ func (r *Registry) adoptionDisabled(ctx context.Context) bool {
 	return false
 }
 
+func (r *Registry) adopt(ctx context.Context, nl sqlbase.OptionalNodeLivenessI, job *Job) error {
+	job.mu.Lock()
+	cachedLease := job.mu.payload.Lease
+	job.mu.Unlock()
+	// If we're running as a tenant (!ok), then we are the sole SQL server in
+	// charge of its jobs and ought to adopt all of them. Otherwise, look more
+	// closely at who is running the job and whether to adopt.
+	if nodeID, ok := r.nodeID.OptionalNodeID(); ok && nodeID != cachedLease.NodeID {
+		// If no liveness is available, adopt all jobs. This is reasonable because this
+		// only affects SQL tenants, which have at most one SQL server running on their
+		// behalf at any given time.
+		if nl != nil {
+			// Another node holds the lease on the job, see if we should steal it.
+			// If no liveness is available, adopt all jobs. This is reasonable because this
+			// only affects SQL tenants, which have at most one SQL server running on their
+			// behalf at any given time.
+			nodeIDRunningJob := cachedLease.NodeID
+			var weAreAlive, theyAreDead bool
+			// We subtract the leniency interval here to artificially widen the range
+			// of times over which the job registry will consider the node to be
+			// alive.  We rely on the fact that only a live node updates its own
+			// expiration.  Thus, the expiration time can be used as a reasonable
+			// measure of when the node was last seen.
+			now := r.lenientNow()
+			for _, liveness := range nl.GetLivenesses() {
+				// Don't try to start any more jobs unless we're really live,
+				// otherwise we'd just immediately cancel them.
+				if liveness.NodeID == r.nodeID.DeprecatedNodeID(multiTenancyIssueNo) {
+					if !liveness.IsLive(r.clock.Now().GoTime()) {
+						return errors.Errorf(
+							"trying to adopt jobs on node %d which is not live", liveness.NodeID)
+					}
+					weAreAlive = true
+				}
+				if liveness.NodeID == nodeIDRunningJob {
+					if liveness.IsLive(now) {
+						// cancel thejob in case we were running it.
+						r.unregister(*job.ID())
+					}
+					theyAreDead = true
+				}
+				if weAreAlive && theyAreDead {
+					break
+				}
+			}
+		}
+	}
+
+	// Below we know that this node holds the lease on the job, or that we want
+	// to adopt it anyway because the leaseholder seems dead.
+	if err := r.db.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
+		const selectStmt = "SELECT status, payload, progress FROM system.jobs WHERE id = $1"
+		row, err := j.registry.ex.QueryRowEx(
+			ctx, "log-job", txn, sqlbase.InternalExecutorSessionDataOverride{User: security.RootUser},
+			selectStmt, *j.id)
+		if err != nil {
+			return err
+		}
+		if row == nil {
+			return errors.Errorf("no such job %d found", *j.id)
+		}
+
+		statusString, ok := row[0].(*tree.DString)
+		if !ok {
+			return errors.Errorf("Job: expected string status on job %d, but got %T", *j.id, statusString)
+		}
+		status := Status(*statusString)
+		if payload, err = UnmarshalPayload(row[1]); err != nil {
+			return err
+		}
+		if progress, err = UnmarshalProgress(row[2]); err != nil {
+			return err
+		}
+
+		md := JobMetadata{
+			ID:       *j.id,
+			Status:   status,
+			Payload:  payload,
+			Progress: progress,
+		}
+		var ju JobUpdater
+		if err := updateFn(txn, md, &ju); err != nil {
+			return err
+		}
+
+		if !ju.hasUpdates() {
+			return nil
+		}
+
+		// Build a statement of the following form, depending on which properties
+		// need updating:
+		//
+		//   UPDATE system.jobs
+		//   SET
+		//     [status = $2,]
+		//     [payload = $y,]
+		//     [progress = $z]
+		//   WHERE
+		//     id = $1
+
+		var setters []string
+		params := []interface{}{*j.id} // $1 is always the job ID.
+		addSetter := func(column string, value interface{}) {
+			params = append(params, value)
+			setters = append(setters, fmt.Sprintf("%s = $%d", column, len(params)))
+		}
+
+		if ju.md.Status != "" {
+			addSetter("status", ju.md.Status)
+		}
+
+		if ju.md.Payload != nil {
+			payload = ju.md.Payload
+			payloadBytes, err := protoutil.Marshal(payload)
+			if err != nil {
+				return err
+			}
+			addSetter("payload", payloadBytes)
+		}
+
+		if ju.md.Progress != nil {
+			progress = ju.md.Progress
+			progress.ModifiedMicros = timeutil.ToUnixMicros(txn.ReadTimestamp().GoTime())
+			progressBytes, err := protoutil.Marshal(progress)
+			if err != nil {
+				return err
+			}
+			addSetter("progress", progressBytes)
+		}
+
+		updateStmt := fmt.Sprintf(
+			"UPDATE system.jobs SET %s WHERE id = $1",
+			strings.Join(setters, ", "),
+		)
+		n, err := j.registry.ex.Exec(ctx, "job-update", txn, updateStmt, params...)
+		if err != nil {
+			return err
+		}
+		if n != 1 {
+			return errors.Errorf(
+				"Job: expected exactly one row affected, but %d rows affected by job update", n,
+			)
+		}
+		return nil
+	}); err != nil {
+		return err
+	}
+	if payload != nil {
+		j.mu.Lock()
+		j.mu.payload = *payload
+		j.mu.Unlock()
+	}
+	if progress != nil {
+		j.mu.Lock()
+		j.mu.progress = *progress
+		j.mu.Unlock()
+	}
+	return nil
+}
+	return job.Update(ctx, func(txn *kv.Txn, md JobMetadata, ju *JobUpdater) error {
+		if !md.Payload.Lease.Equal(cachedLease) {
+			return errors.Errorf("lease from jobs table %v did not match cached lease %v",
+				md.Payload.Lease, cachedLease)
+		}
+		md.Payload.Lease = r.newLease()
+		if md.Payload.StartedMicros == 0 {
+			md.Payload.StartedMicros = timeutil.ToUnixMicros(r.clock.Now().GoTime())
+		}
+		ju.UpdatePayload(md.Payload)
+		return nil
+	})
+}
+
 func (r *Registry) maybeAdoptJob(
 	ctx context.Context, nlw sqlbase.OptionalNodeLiveness, randomizeJobOrder bool,
 ) error {
@@ -1009,41 +1181,6 @@ WHERE status IN ($1, $2, $3, $4, $5) ORDER BY created DESC`
 	if randomizeJobOrder {
 		rand.Seed(timeutil.Now().UnixNano())
 		rand.Shuffle(len(rows), func(i, j int) { rows[i], rows[j] = rows[j], rows[i] })
-	}
-
-	type nodeStatus struct {
-		isLive bool
-	}
-	nodeStatusMap := map[roachpb.NodeID]*nodeStatus{
-		// 0 is not a valid node ID, but we treat it as an always-dead node so that
-		// the empty lease (Lease{}) is always considered expired.
-		0: {isLive: false},
-	}
-	// If no liveness is available, adopt all jobs. This is reasonable because this
-	// only affects SQL tenants, which have at most one SQL server running on their
-	// behalf at any given time.
-	if nl, ok := nlw.Optional(47892); ok {
-		// We subtract the leniency interval here to artificially
-		// widen the range of times over which the job registry will
-		// consider the node to be alive.  We rely on the fact that
-		// only a live node updates its own expiration.  Thus, the
-		// expiration time can be used as a reasonable measure of
-		// when the node was last seen.
-		now := r.lenientNow()
-		for _, liveness := range nl.GetLivenesses() {
-			nodeStatusMap[liveness.NodeID] = &nodeStatus{
-				isLive: liveness.IsLive(now),
-			}
-
-			// Don't try to start any more jobs unless we're really live,
-			// otherwise we'd just immediately cancel them.
-			if liveness.NodeID == r.nodeID.DeprecatedNodeID(multiTenancyIssueNo) {
-				if !liveness.IsLive(r.clock.Now().GoTime()) {
-					return errors.Errorf(
-						"trying to adopt jobs on node %d which is not live", liveness.NodeID)
-				}
-			}
-		}
 	}
 
 	if log.V(3) {
@@ -1114,41 +1251,12 @@ WHERE status IN ($1, $2, $3, $4, $5) ORDER BY created DESC`
 			continue
 		}
 
-		r.mu.Lock()
-		_, runningOnNode := r.mu.jobs[*id]
-		r.mu.Unlock()
-
-		// If we're running as a tenant (!ok), then we are the sole SQL server in
-		// charge of its jobs and ought to adopt all of them. Otherwise, look more
-		// closely at who is running the job and whether to adopt.
-		if nodeID, ok := r.nodeID.OptionalNodeID(); ok && nodeID != payload.Lease.NodeID {
-			// Another node holds the lease on the job, see if we should steal it.
-			if runningOnNode {
-				// If we are currently running a job that another node has the lease on,
-				// stop running it.
-				log.Warningf(ctx, "job %d: node %d owns lease; canceling", *id, payload.Lease.NodeID)
-				r.unregister(*id)
-				continue
-			}
-			nodeStatus, ok := nodeStatusMap[payload.Lease.NodeID]
-			if !ok {
-				// This case should never happen.
-				log.ReportOrPanic(ctx, nil, "job %d: skipping: no liveness record for the job's node %d",
-					log.Safe(*id), payload.Lease.NodeID)
-				continue
-			}
-			if nodeStatus.isLive {
-				if log.V(2) {
-					log.Infof(ctx, "job %d: skipping: another node is live and holds the lease", *id)
-				}
-				continue
-			}
-		}
-
-		// Below we know that this node holds the lease on the job, or that we want
-		// to adopt it anyway because the leaseholder seems dead.
+		nl, _ := nlw.Optional(47892)
 		job := &Job{id: id, registry: r}
-		resumeCtx, cancel := r.makeCtx()
+		job.mu.payload = *payload
+		if err := r.adopt(ctx, nl, job); err != nil {
+			return errors.Wrapf(err, "could not adopt job %d", *id)
+		}
 
 		if pauseRequested := status == StatusPauseRequested; pauseRequested {
 			if err := job.paused(ctx, func(context.Context, *kv.Txn) error {
@@ -1162,6 +1270,7 @@ WHERE status IN ($1, $2, $3, $4, $5) ORDER BY created DESC`
 			continue
 		}
 
+		resumeCtx, cancel := r.makeCtx()
 		if cancelRequested := status == StatusCancelRequested; cancelRequested {
 			if err := job.reverted(ctx, errJobCanceled, func(context.Context, *kv.Txn) error {
 				// Unregister the job in case it is running on the node.
