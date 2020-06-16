@@ -64,6 +64,9 @@ var (
 		"jobs.retention_time",
 		"the amount of time to retain records for completed jobs before",
 		time.Hour*24*14)
+	operatingStatus = fmt.Sprintf("(%s, %s, %s, %s, %s)",
+		StatusRunning, StatusCancelRequested, StatusPauseRequested, StatusReverting,
+	)
 )
 
 // Registry creates Jobs and manages their leases and cancelation.
@@ -240,6 +243,12 @@ func (r *Registry) CurrentlyRunningJobs() []int64 {
 		i++
 	}
 	return jobs
+}
+
+// ID returns a unique during the lifetume of the registry id that is
+// used for keying sqlliveness claims held by the registry.
+func (r *Registry) ID() string {
+	return r.nodeID.SQLInstanceID().String()
 }
 
 // lenientNow returns the timestamp after which we should attempt
@@ -934,6 +943,52 @@ func (r *Registry) stepThroughStateMachine(
 	}
 }
 
+func (r *Registry) resumeNew(
+	ctx context.Context, resumer Resumer, resultsCh chan<- tree.Datums, job *Job, status Status,
+) (<-chan error, error) {
+	errCh := make(chan error, 1)
+	taskName := fmt.Sprintf(`job-%d`, *job.ID())
+	if err := r.stopper.RunAsyncTask(ctx, taskName, func(ctx context.Context) {
+		// Bookkeeping.
+		phs, cleanup := r.planFn("resume-"+taskName, job.mu.payload.Username)
+		defer cleanup()
+		spanName := fmt.Sprintf(`%s-%d`, job.mu.payload.Type(), *job.ID())
+		var span opentracing.Span
+		ctx, span = r.ac.AnnotateCtxWithSpan(ctx, spanName)
+		defer span.Finish()
+
+		// Run the actual job.
+		var finalResumeError error
+		if job.mu.payload.FinalResumeError != nil {
+			finalResumeError = errors.DecodeError(ctx, *job.mu.payload.FinalResumeError)
+		}
+		err := r.stepThroughStateMachine(ctx, phs, resumer, resultsCh, job, status, finalResumeError)
+		if err != nil {
+			// TODO (lucy): This needs to distinguish between assertion errors in
+			// the job registry and assertion errors in job execution returned from
+			// Resume() or OnFailOrCancel(), and only fail on the former. We have
+			// tests that purposely introduce bad state in order to produce
+			// assertion errors, which shouldn't cause the test to panic. For now,
+			// comment this out.
+			// if errors.HasAssertionFailure(err) {
+			// 	log.ReportOrPanic(ctx, nil, err.Error())
+			// }
+			log.Errorf(ctx, "job %d: adoption completed with error %v", *job.ID(), err)
+		}
+		newStatus, err := job.CurrentStatus(ctx)
+		if err != nil {
+			log.Errorf(ctx, "job %d: failed querying status: %v", *job.ID(), err)
+		} else {
+			log.Infof(ctx, "job %d: status %s after adoption finished", *job.ID(), newStatus)
+		}
+		r.unregister(*job.ID())
+		errCh <- err
+	}); err != nil {
+		return nil, err
+	}
+	return errCh, nil
+}
+
 // resume starts or resumes a job. If no error is returned then the job was
 // asynchronously executed. The job is executed with the ctx, so ctx must
 // only by canceled if the job should also be canceled. resultsCh is passed
@@ -1001,6 +1056,170 @@ func (r *Registry) adoptionDisabled(ctx context.Context) bool {
 		return true
 	}
 	return false
+}
+
+func (r *Registry) claimJobs(ctx context.Context) error {
+	// the session pkg will encapsulate the heatbeating
+	return r.db.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
+		// select all (name, epoch) pairs from sqlliveness where expiration < now()
+		// bump the epochs
+		// cache of live sessions of all nodes, GetLiveSessions(now())
+		// name --> current session  channel
+		row, err := r.ex.QueryRowEx(
+			ctx, "registry-current-liveness-epoch", txn,
+			sqlbase.InternalExecutorSessionDataOverride{User: security.RootUser},
+			`SELECT epoch FROM system.sqlliveness_sessions WHERE name = $1 AND status IN $2`,
+			r.ID(), operatingStatus,
+		)
+		if err != nil {
+			return errors.Wrap(err, "could not query jobs table")
+		}
+		if row == nil {
+			// TODO handle this more gracefully
+			panic("we have lost our liveness record")
+		}
+		epoch := int64(*row[0].(*tree.DInt))
+
+		// TODO this needs to also steal other jobs not only unclaimed ones.
+		_, err = r.ex.Query(
+			ctx, "adopt-job-sqlliveness", txn, `
+UPDATE system.jobs SET sqlliveness_name = $1 sqlliveness_epoch = $2
+WHERE sqlliveness_name = $3 RETURNING id ORDER BY created LIMIT $4 DESC`,
+			r.ID(), epoch, "", maxAdoptionsPerLoop,
+		)
+		if err != nil {
+			return errors.Wrap(err, "could not query jobs table")
+		}
+		return nil
+	})
+}
+
+func (r *Registry) processClaimedJobs(ctx context.Context) error {
+	// TODO look up current epoch and add it.
+	// get new cached session
+	whereClaimedJobs := fmt.Sprintf("sqlliveness_name = %s", r.ID())
+
+	// Serve pause and cancel requests.
+	if err := r.db.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
+		rows, err := r.ex.QueryEx(
+			ctx, "cancel/pause-requested", txn, sqlbase.InternalExecutorSessionDataOverride{User: security.RootUser}, `
+UPDATE system.jobs
+SET status =
+		CASE
+			WHEN status = $1 THEN $2
+			WHEN status = $3 THEN $4
+			ELSE status
+		END 
+WHERE status IN ($1, $3) AND $5
+RETURNING id`,
+			StatusPauseRequested, StatusPaused,
+			StatusCancelRequested, StatusReverting,
+			whereClaimedJobs,
+		)
+		if err != nil {
+			return errors.Wrap(err, "could not query jobs table")
+		}
+		for _, row := range rows {
+			id := int64(*row[0].(*tree.DInt))
+			r.unregister(id)
+		}
+		return nil
+	}); err != nil {
+		return errors.Wrapf(err, "Registry %s: could not execute requests to cancel/pause jobs", r.ID())
+	}
+
+	var claimedToResume map[int64]bool
+	// Review jobs claimed as running or reverting.
+	if err := r.db.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
+		rows, err := r.ex.QueryEx(
+			ctx, "running/reverting-jobs", txn, sqlbase.InternalExecutorSessionDataOverride{User: security.RootUser},
+			`SELECT id FROM system.jobs WHERE (status = $1 OR status = $2) AND $3`,
+			StatusRunning, StatusReverting, whereClaimedJobs,
+		)
+		if err != nil {
+			return err
+		}
+		claimedToResume = make(map[int64]bool, len(rows))
+		for _, row := range rows {
+			id := int64(*row[0].(*tree.DInt))
+			claimedToResume[id] = true
+		}
+		return nil
+	}); err != nil {
+		return errors.Wrapf(err, "Registry %s: could not resume all claimed jobs", r.ID())
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for id, cancel := range r.mu.jobs {
+		if _, ok := claimedToResume[id]; ok {
+			// job id is already resumed, nothing to do.
+			// Maybe check status??
+			delete(claimedToResume, id)
+			continue
+		}
+		// We are running a job which we haven't claimed.
+		// TODO log warning
+		cancel()
+		delete(r.mu.jobs, id)
+	}
+
+	for id := range claimedToResume {
+		row, err := r.ex.QueryRowEx(
+			ctx, "job-payload", nil, sqlbase.InternalExecutorSessionDataOverride{User: security.RootUser},
+			`SELECT status, payload, progress FROM system.jobs WHERE id = $1`, id,
+		)
+		if err != nil {
+			return err
+		}
+		if row == nil {
+			// ReportOrPanic
+			panic("invariant broken")
+		}
+		statusString, ok := row[0].(*tree.DString)
+		if !ok {
+			return errors.Errorf("Job: expected string status on job %d, but got %T", id, statusString)
+		}
+		status := Status(*statusString)
+		if status != StatusRunning || status != StatusReverting {
+			panic("invariant broken")
+		}
+		payload, err := UnmarshalPayload(row[1])
+		if err != nil {
+			return err
+		}
+		progress, err := UnmarshalProgress(row[2])
+		if err != nil {
+			return err
+		}
+		job := &Job{id: &id, registry: r}
+		job.mu.payload = *payload
+		job.mu.progress = *progress
+		resumer, err := r.createResumer(job, r.settings)
+		if err != nil {
+			return err
+		}
+		log.Infof(ctx, "job %d: resuming execution", id)
+		resumeCtx, cancel := r.makeCtx()
+		resultsCh := make(chan tree.Datums)
+		errCh, err := r.resumeNew(resumeCtx, resumer, resultsCh, job, status)
+		if err != nil {
+			return err
+		}
+		r.mu.jobs[id] = cancel
+		go func() {
+			// Drain and ignore results.
+			for range resultsCh {
+			}
+		}()
+		go func() {
+			// Wait for the job to finish. No need to print the error because if there
+			// was one it's been set in the job status already.
+			<-errCh
+			close(resultsCh)
+		}()
+	}
+	return nil
 }
 
 func (r *Registry) maybeAdoptJob(
